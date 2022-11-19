@@ -5,6 +5,7 @@ import asyncio
 import json
 import random
 import re
+import statistics
 from collections import defaultdict
 from typing import Awaitable, Callable, Optional
 
@@ -20,7 +21,8 @@ from server.db.models import (
     game_featuredMods,
     game_player_stats,
     game_stats,
-    leaderboard
+    leaderboard,
+    leaderboard_rating_journal
 )
 from server.db.models import map as t_map
 from server.db.models import (
@@ -41,11 +43,19 @@ from server.matchmaker import (
     MapPool,
     MatchmakerQueue,
     OnMatchedCallback,
+    PopTimer,
     Search
 )
+from server.matchmaker.algorithm.team_matchmaker import TeamMatchMaker
+from server.matchmaker.search import Match, are_searches_disjoint
 from server.metrics import MatchLaunch
 from server.players import Player, PlayerState
 from server.types import GameLaunchOptions, Map, NeroxisGeneratedMap
+
+
+def has_no_overlap(match: Match, matches_tmm_searches: set[Search]):
+    searches_in_match = set(search for team in match for search in team.get_original_searches())
+    return are_searches_disjoint(searches_in_match, matches_tmm_searches)
 
 
 @with_logger
@@ -61,6 +71,7 @@ class LadderService(Service):
         game_service: GameService,
         violation_service: ViolationService,
     ):
+        self._is_running = True
         self._db = database
         self._informed_players: set[Player] = set()
         self.game_service = game_service
@@ -68,10 +79,51 @@ class LadderService(Service):
         self.violation_service = violation_service
 
         self._searches: dict[Player, dict[str, Search]] = defaultdict(dict)
+        self.timer = None
+        self.matchmaker = TeamMatchMaker()
+        self.timer = PopTimer()
 
     async def initialize(self) -> None:
         await self.update_data()
         self._update_cron = aiocron.crontab("*/10 * * * *", func=self.update_data)
+        await self._initialize_pop_timer()
+
+    async def _initialize_pop_timer(self) -> None:
+        self.timer.queues = list(self.queues.values())
+        asyncio.create_task(self._queue_pop_timer())
+
+    async def _queue_pop_timer(self) -> None:
+        """ Periodically tries to match all Searches in the queue. The amount
+        of time until next queue 'pop' is determined by the number of players
+        in the queue.
+        """
+        self._logger.debug("MatchmakerQueue pop timer initialized")
+        while self._is_running:
+            try:
+                await self.timer.next_pop()
+                await self._queue_pop_iteration()
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self._logger.exception(
+                    "Unexpected error during queue pop timer loop!"
+                )
+                # To avoid potential busy loops
+                await asyncio.sleep(1)
+        self._logger.error("popping queues stopped")
+
+    async def _queue_pop_iteration(self):
+        possible_games = list()
+        for queue in self.queues.values():
+            possible_games += await queue.find_matches()
+        matches_tmm = self.matchmaker.pick_noncolliding_games(possible_games)
+        await self._found_matches(matches_tmm)
+
+    async def _found_matches(self, matches: list[Match]):
+        for queue in self.queues.values():
+            await queue.found_matches([match for match in matches if match[0].queue == queue])
+            self.game_service.mark_dirty(queue)
 
     async def update_data(self) -> None:
         async with self._db.acquire() as conn:
@@ -81,8 +133,10 @@ class LadderService(Service):
         for name, info in db_queues.items():
             if name not in self.queues:
                 queue = MatchmakerQueue(
-                    self.game_service,
-                    self.on_match_found,
+                    game_service=self.game_service,
+                    on_match_found=self.on_match_found,
+                    timer=self.timer,
+                    matchmaker=self.matchmaker,
                     name=name,
                     queue_id=info["id"],
                     featured_mod=info["mod"],
@@ -91,12 +145,12 @@ class LadderService(Service):
                     params=info.get("params")
                 )
                 self.queues[name] = queue
-                queue.initialize()
             else:
                 queue = self.queues[name]
                 queue.featured_mod = info["mod"]
                 queue.rating_type = info["rating_type"]
                 queue.team_size = info["team_size"]
+                queue.rating_peak = await self.fetch_rating_peak(info["rating_type"])
             queue.map_pools.clear()
             for map_pool_id, min_rating, max_rating in info["map_pools"]:
                 map_pool_name, map_list = map_pool_maps[map_pool_id]
@@ -115,7 +169,6 @@ class LadderService(Service):
         # Remove queues that don't exist anymore
         for queue_name in list(self.queues.keys()):
             if queue_name not in db_queues:
-                self.queues[queue_name].shutdown()
                 del self.queues[queue_name]
 
     async def fetch_map_pools(self, conn) -> dict[int, tuple[str, list[Map]]]:
@@ -221,6 +274,50 @@ class LadderService(Service):
                 errored.add(name)
         return matchmaker_queues
 
+    async def fetch_rating_peak(self, rating_type):
+        async with self._db.acquire() as conn:
+            result = await conn.execute(
+                select([
+                    leaderboard_rating_journal.c.rating_mean_before,
+                    leaderboard_rating_journal.c.rating_deviation_before
+                ])
+                .select_from(leaderboard_rating_journal.join(leaderboard))
+                .where(leaderboard.c.technical_name == rating_type)
+                .order_by(leaderboard_rating_journal.c.id.desc())
+                .limit(1000)
+            )
+            rows = result.fetchall()
+            rowcount = len(rows)
+
+            rating_peak = 1000.0
+            if rowcount > 0:
+                rating_peak = statistics.mean(
+                    row.rating_mean_before - 3 * row.rating_deviation_before for row in rows
+                )
+            metrics.leaderboard_rating_peak.labels(rating_type).set(rating_peak)
+
+            if rowcount < 100:
+                self._logger.warning(
+                    "Could only fetch %s ratings for %s queue.",
+                    rowcount,
+                    rating_type
+                )
+
+            if rating_peak < 600 or rating_peak > 1200:
+                self._logger.warning(
+                    "Estimated rating peak for %s is %s. This could lead to issues with matchmaking.",
+                    rating_type,
+                    rating_peak
+                )
+            else:
+                self._logger.info(
+                    "Estimated rating peak for %s is %s.",
+                    rating_type,
+                    rating_peak
+                )
+
+            return rating_peak
+
     def start_search(
         self,
         players: list[Player],
@@ -276,9 +373,10 @@ class LadderService(Service):
 
         queue = self.queues[queue_name]
         search = Search(
-            players,
+            players=players,
             rating_type=queue.rating_type,
-            on_matched=on_matched
+            on_matched=on_matched,
+            queue=queue
         )
 
         for player in players:
@@ -676,8 +774,7 @@ class LadderService(Service):
             self._informed_players.remove(player)
 
     async def shutdown(self):
-        for queue in self.queues.values():
-            queue.shutdown()
+        self._is_running = False
 
 
 class NotConnectedError(asyncio.TimeoutError):

@@ -2,28 +2,22 @@ import logging
 import statistics
 from collections import defaultdict
 from math import sqrt
-from typing import Iterable, NamedTuple
+from typing import Iterable
 
 from sortedcontainers import SortedList
 
 from ...config import config
 from ...decorators import with_logger
-from ..search import CombinedSearch, Match, Search, get_average_rating
+from ..game_candidate import GameCandidate
+from ..search import (
+    CombinedSearch,
+    Match,
+    Search,
+    are_searches_disjoint,
+    get_average_rating
+)
 from .matchmaker import Matchmaker
 from .stable_marriage import StableMarriageMatchmaker
-
-
-class GameCandidate(NamedTuple):
-    """
-    Holds the participating searches and a quality rating for a potential game
-    from the matchmaker. The quality is not the trueskill quality!
-    """
-    match: Match
-    quality: float
-
-    @property
-    def all_searches(self) -> set[Search]:
-        return set(search for team in self.match for search in team.get_original_searches())
 
 
 class UnevenTeamsException(Exception):
@@ -37,7 +31,7 @@ class NotEnoughPlayersException(Exception):
 @with_logger
 class TeamMatchMaker(Matchmaker):
     """
-    Matchmaker for teams of varied size. Untested for higher than 4v4 but it should work
+    Matchmaker for teams of varied size. Untested for higher than 4v4 but it should work.
 
     Overview of the algorithm:
     1. list all the parties in queue by their average rating.
@@ -52,22 +46,21 @@ class TeamMatchMaker(Matchmaker):
     4. add this game to a games list
     5. repeat 2. to 4. for every party.
     6. you now have a list of potential games with minimal rating variation and minimal rating imbalance.
-    7. remove all games with match quality below threshold then sort by quality descending
-    8. pick the first game from the game list and remove all other games that contain the same players
-    9. repeat 8. until the list is empty
     """
 
-    def find(self, searches: Iterable[Search], team_size: int) -> tuple[list[Match], list[Search]]:
+    def find(
+        self, searches: Iterable[Search], team_size: int, rating_peak: float
+    ) -> list[GameCandidate]:
         if not searches:
-            return [], []
+            return []
 
         if team_size == 1:
-            return StableMarriageMatchmaker().find(searches, 1)
+            return [GameCandidate(match, config.MINIMUM_GAME_QUALITY)
+                    for match in StableMarriageMatchmaker().find(searches, team_size, rating_peak)]
 
         searches = SortedList(searches, key=lambda s: s.average_rating)
         possible_games = []
 
-        self._logger.debug("========= starting matching algorithm =========")
         self._logger.debug("Searches in queue: %s", list(searches))
 
         for index, search in enumerate(searches):
@@ -77,7 +70,7 @@ class TeamMatchMaker(Matchmaker):
             try:
                 participants = self.pick_neighboring_players(searches, index, team_size)
                 match = self.make_teams(participants, team_size)
-                game = self.assign_game_quality(match, team_size)
+                game = self.assign_game_quality(match, team_size, rating_peak)
                 possible_games.append(game)
             except NotEnoughPlayersException:
                 self._logger.warning("Couldn't pick enough players for a full game. Skipping this game...")
@@ -94,13 +87,7 @@ class TeamMatchMaker(Matchmaker):
                     game.match[0].cumulative_rating - game.match[1].cumulative_rating,
                     game.quality
                 )
-
-        matches = self.pick_noncolliding_games(possible_games)
-        for match in matches:
-            for team in match:
-                for search in team.get_original_searches():
-                    searches.remove(search)
-        return matches, list(searches)
+        return possible_games
 
     @staticmethod
     def pick_neighboring_players(searches: list[Search], index: int, team_size: int) -> list[Search]:
@@ -268,19 +255,24 @@ class TeamMatchMaker(Matchmaker):
         self._logger.debug("used %s as best filler", [candidate])
         return candidate
 
-    def assign_game_quality(self, match: Match, team_size: int) -> GameCandidate:
+    def assign_game_quality(self, match: Match, team_size: int, rating_peak: float) -> GameCandidate:
         newbie_bonus = 0
         time_bonus = 0
+        minority_bonus = 0
         ratings = []
         for team in match:
             for search in team.get_original_searches():
                 ratings.append(search.average_rating)
-                # Time bonus accumulation for a game should not depend on team size or whether the participants are premade or not.
-                search_time_bonus = search.failed_matching_attempts * config.TIME_BONUS * len(search.players) / team_size
-                time_bonus += min(search_time_bonus, config.MAXIMUM_TIME_BONUS * len(search.players) / team_size)
+                # Time bonus accumulation for a game should not depend on
+                # team size or whether the participants are premade or not.
+                normalize_size = len(search.players) / team_size
+                search_time_bonus = search.failed_matching_attempts * config.TIME_BONUS * normalize_size
+                time_bonus += min(search_time_bonus, config.MAXIMUM_TIME_BONUS * normalize_size)
                 num_newbies = search.num_newbies()
                 search_newbie_bonus = search.failed_matching_attempts * config.NEWBIE_TIME_BONUS * num_newbies / team_size
                 newbie_bonus += min(search_newbie_bonus, config.MAXIMUM_NEWBIE_TIME_BONUS * num_newbies / team_size)
+
+                minority_bonus = ((search.average_rating - rating_peak) * 0.001) ** 4 * normalize_size * config.MINORITY_BONUS
 
         rating_disparity = abs(match[0].cumulative_rating - match[1].cumulative_rating)
         unfairness = rating_disparity / config.MAXIMUM_RATING_IMBALANCE
@@ -289,12 +281,13 @@ class TeamMatchMaker(Matchmaker):
 
         # Visually this creates a cone in the unfairness-rating_variety plane
         # that slowly raises with the time bonuses.
-        quality = 1 - sqrt(unfairness ** 2 + rating_variety ** 2) + time_bonus
+        quality = 1 - sqrt(unfairness ** 2 + rating_variety ** 2) + time_bonus + minority_bonus
         if not any(team.has_high_rated_player() for team in match):
             quality += newbie_bonus
         self._logger.debug(
             "bonuses: %s rating disparity: %s -> unfairness: %f deviation: %f -> variety: %f -> game quality: %f",
-            newbie_bonus + time_bonus, rating_disparity, unfairness, deviation, rating_variety, quality)
+            newbie_bonus + time_bonus + minority_bonus, rating_disparity, unfairness, deviation, rating_variety, quality
+        )
         return GameCandidate(match, quality)
 
     def pick_noncolliding_games(self, games: list[GameCandidate]) -> list[Match]:
@@ -313,7 +306,7 @@ class TeamMatchMaker(Matchmaker):
         matches = []
         used_searches = set()
         for game in reversed(games):
-            if used_searches.isdisjoint(game.all_searches):
+            if are_searches_disjoint(used_searches, game.all_searches):
                 matches.append(game.match)
                 used_searches.update(game.all_searches)
                 self._logger.debug("used players: %s", [search for search in used_searches])
